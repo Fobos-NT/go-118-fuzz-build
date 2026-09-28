@@ -1,6 +1,7 @@
 package testing
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -32,6 +33,10 @@ func (t *T) Cleanup(f func()) {
 	f()
 }
 
+func (t *T) Context() context.Context {
+	return context.Background()
+}
+
 func (t *T) Deadline() (deadline time.Time, ok bool) {
 	panic(unsupportedApi("t.Deadline()"))
 }
@@ -51,7 +56,6 @@ func (t *T) Fail() {
 }
 
 func (t *T) FailNow() {
-	panic("Called T.Fail()")
 	panic(unsupportedApi("t.FailNow()"))
 }
 
@@ -87,7 +91,8 @@ func (t *T) Parallel() {
 	panic(unsupportedApi("t.Parallel()"))
 }
 func (t *T) Run(name string, f func(t *T)) bool {
-	panic(unsupportedApi("t.Run()"))
+	f(t)
+	return true
 }
 
 func (t *T) Setenv(key, value string) {
@@ -127,3 +132,5 @@ func (t *T) CleanupTempDirs() {
 		}
 	}
 }
+
+// TODO: ADD TempDirs to testing.T and get CleanupTempDirs in the std lib to

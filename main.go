@@ -2,23 +2,43 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"go/token"
 	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"text/template"
 
 	"golang.org/x/tools/go/packages"
 )
 
+type Data struct {
+	PkgPath      string
+	Func         string
+	Declarations string
+	FuzzerParams string
+	PkgName      string
+
+	Proto             bool
+	ProtoImport       string
+	ProtoCodecImports string
+	ProtoType         string
+	ProtoUnmarshal    string
+	ProtoMarshal      string
+	ProtoFormat       string
+}
+
 var (
-	flagFunc      = flag.String("func", "Fuzz", "fuzzer entry point")
-	flagO         = flag.String("o", "", "output file")
-	flagPath      = flag.String("abs_path", "", "absolute path to fuzzer")
-	flagSanitizer = flag.String("sanitizer", "address", "The sanitizer to compile the target with. Either 'address' or 'coverage'.")
-	flagCoverpkg  = flag.String("coverpkg", "./...", "the value go-118-fuzz-build passes to the 'coverpkg' flag in coverage builds. Should be the module name+'/...'")
+	flagFunc        = flag.String("func", "Fuzz", "fuzzer entry point")
+	flagO           = flag.String("o", "", "output file")
+	flagPath        = flag.String("abs_path", "", "absolute path to fuzzer")
+	flagSanitizer   = flag.String("sanitizer", "address", "The sanitizer to compile the target with. Either 'address' or 'coverage'")
+	flagCoverpkg    = flag.String("coverpkg", "./...", "the value go-118-fuzz-build passes to the 'coverpkg' flag in coverage builds. Should be the module name+'/...'")
+	flagProto       = flag.Bool("proto", false, "build a structure-aware fuzzer with github.com/yandex-cloud/go-protobuf-mutator. The fuzzer must call 'f.Fuzz(func(t *testing.T, msg *pb.MyMessage){...})'")
+	flagProtoFormat = flag.String("proto_format", protoFormatText, "the encoding of the testcases of a '-proto' fuzzer. Either 'binary' or 'text'")
 
 	flagRace    = flag.Bool("race", false, "enable data race detection")
 	flagTags    = flag.String("tags", "", "a comma-separated list of build tags to consider satisfied during the build")
@@ -34,7 +54,9 @@ var (
 		packages.NeedFiles |
 		packages.NeedCompiledGoFiles |
 		packages.NeedImports |
-		packages.NeedDeps
+		packages.NeedDeps |
+		packages.NeedTypes |
+		packages.NeedModule
 )
 
 var include, ignore []string
@@ -44,6 +66,10 @@ func main() {
 
 	if !token.IsIdentifier(*flagFunc) || !token.IsExported(*flagFunc) {
 		log.Fatal("-func must be an exported identifier")
+	}
+
+	if *flagProto {
+		LoadMode |= packages.NeedSyntax | packages.NeedTypesInfo
 	}
 
 	tags := "gofuzz_libfuzzer,libfuzzer"
@@ -77,6 +103,7 @@ func main() {
 	if strings.Contains(path, "...") {
 		log.Fatal("package path must not contain ... wildcards")
 	}
+	sanitizer := *flagSanitizer
 
 	include = strings.Split(*flagInclude, ",")
 	ignore = []string{
@@ -90,6 +117,11 @@ func main() {
 	}
 	buildFlags = append(buildFlags, "-gcflags", "all=-d=libfuzzer")
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
+
 	//fset := token.NewFileSet()
 	pkgs, err := packages.Load(&packages.Config{
 		Mode:       LoadMode,
@@ -98,6 +130,13 @@ func main() {
 	}, "pattern="+path)
 	if err != nil {
 		log.Fatal("failed to load packages:", err)
+	}
+	fuzzerPackage := pkgs[0]
+	var modulePath string
+	if fuzzerPackage.Module == nil {
+		modulePath = ""
+	} else {
+		modulePath = fuzzerPackage.Module.Path
 	}
 	visit := func(pkg *packages.Package) {
 		if !shouldInstrument(pkg.PkgPath) {
@@ -108,81 +147,102 @@ func main() {
 	if packages.PrintErrors(pkgs) != 0 {
 		os.Exit(1)
 	}
-	/*if len(pkgs) != 1 {
-		log.Fatal("package path matched multiple packages")
-	}*/
+	walker := NewFileWalker()
+	walker.sanitizer = sanitizer
+	defer walker.cleanUp()
 
-	fuzzerFile, originalFuzzContents, err := rewriteTestingImports(pkgs, *flagFunc)
+	var protoTarget *ProtoTarget
+	if *flagProto {
+		protoTarget, err = findProtoTarget(pkgs, *flagFunc, *flagProtoFormat)
+		if err != nil {
+			log.Fatal(err)
+		}
+		walker.protoTarget = protoTarget
+		walker.fuzzerPkgPath = fuzzerPackage.PkgPath
+	}
+
+	err = walker.getAbsPathOfFuzzFile(fuzzerPackage.PkgPath, *flagFunc, buildFlags)
 	if err != nil {
 		panic(err)
 	}
-	os.Remove(fuzzerFile)
-
-	pkg := pkgs[0]
-
-	importPath := pkg.PkgPath
-	if strings.HasPrefix(importPath, "_/") {
-		importPath = path
-	}
-
-	mainFile, err := ioutil.TempFile(".", "main.*.go")
-	if err != nil {
-		log.Fatal("failed to create temporary file:", err)
-	}
-	defer os.Remove(mainFile.Name())
-
-	type Data struct {
-		PkgPath      string
-		Func         string
-		Declarations string
-		FuzzerParams string
-	}
-	/*err = mainTmpl.Execute(os.Stdout, &Data{
-		PkgPath: importPath,
-		Func:    *flagFunc,
-	})*/
-	//return
-	err = mainTmpl.Execute(mainFile, &Data{
-		PkgPath: importPath,
-		Func:    *flagFunc,
-	})
-	if err != nil {
-		log.Fatal("failed to execute template:", err)
-	}
-	if err := mainFile.Close(); err != nil {
-		log.Fatal(err)
-	}
-
-	out := *flagO
-	if out == "" {
-		out = pkg.Name + "-fuzz.a"
-	}
-
-	args := []string{"build", "-o", out}
-	if *flagOverlay != "" {
-		buildFlags = append(buildFlags, "-overlay", *flagOverlay)
-	}
-	args = append(args, buildFlags...)
-	args = append(args, mainFile.Name())
-	cmd := exec.Command("go", args...)
-	//cmd := exec.Command("gotip", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		log.Fatal("failed to build packages:", err)
-	}
-
-	newFile, err := os.Create(fuzzerFile)
+	walker.CreateAndModifyFiles(modulePath, *flagFunc, *flagOverlay, fuzzerPackage.Name)
+	err = os.Chdir(cwd)
 	if err != nil {
 		panic(err)
 	}
-	defer newFile.Close()
-	_, err = newFile.Write(originalFuzzContents)
-	if err != nil {
-		panic(err)
+
+	if sanitizer == "address" {
+		importPath := fuzzerPackage.PkgPath
+		if strings.HasPrefix(importPath, "_/") {
+			importPath = path
+		}
+
+		mainFile, err := ioutil.TempFile(".", "main.*.go")
+		if err != nil {
+			log.Fatal("failed to create temporary file:", err)
+		}
+		defer func() {
+			err = os.Remove(mainFile.Name())
+			if err != nil {
+				panic(err)
+			}
+		}()
+		data := &Data{
+			PkgPath: importPath,
+			Func:    *flagFunc,
+		}
+		if protoTarget != nil {
+			protoTarget.fillData(data, fuzzerPackage.PkgPath, "target")
+		}
+		err = mainTmpl.Execute(mainFile, data)
+		if err != nil {
+			log.Fatal("failed to execute template:", err)
+		}
+		if err := mainFile.Close(); err != nil {
+			log.Fatal(err)
+		}
+
+		out := *flagO
+		if out == "" {
+			out = fuzzerPackage.Name + "-fuzz.a"
+		}
+
+		args := []string{"build"}
+		args = append(args, buildFlags...)
+		if len(walker.overlayArgs) > 0 {
+			args = append(args, walker.overlayArgs...)
+		}
+		args = append(args, "-o")
+		args = append(args, out)
+		args = append(args, mainFile.Name())
+		fmt.Println("Running go ", args)
+		cmd := exec.Command("go", args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Run(); err != nil {
+			panic(err)
+			log.Fatal("failed to build packages:", err)
+		}
+	} else {
+		// coverage sanitizer
+		outPath := fmt.Sprintf("%s/%s", os.Getenv("OUT"), *flagO)
+
+		pwd, err := os.Getwd()
+		if err != nil {
+			panic(err)
+		}
+		defer os.Chdir(pwd)
+		err = os.Chdir(filepath.Dir(walker.fuzzerPath))
+		if err != nil {
+			panic(err)
+		}
+		err = buildTestBinary(outPath, *flagCoverpkg, walker.overlayArgs)
+		if err != nil {
+			panic(err)
+		}
+
 	}
-	os.Remove(fuzzerFile + "_fuzz.go")
 }
 
 // Packages that match one of the include patterns (default is include all packages)
@@ -210,7 +270,8 @@ func matchPattern(pattern, path string) bool {
 
 var mainTmpl = template.Must(template.New("main").Parse(`
 // Code generated by go-118-fuzz-build; DO NOT EDIT.
-
+{{if .Proto}}// The corpus of this fuzzer holds {{.ProtoFormat}} {{.ProtoType}} messages.
+{{end}}
 // +build ignore
 
 package main
@@ -220,26 +281,62 @@ import (
 	"strings"
 	"unsafe"
 	target {{printf "%q" .PkgPath}}
-	"github.com/AdamKorcz/go-118-fuzz-build/testing"
-)
+	"testing"
+{{if .Proto}}{{.ProtoCodecImports}}{{.ProtoImport}}	mutator "github.com/yandex-cloud/go-protobuf-mutator"
+{{end}})
 
 // #include <stdint.h>
 import "C"
 
-//export LLVMFuzzerTestOneInput
+{{if .Proto}}func init() {
+	testing.ProtoUnmarshal = func(data []byte, msg any) error {
+		return {{.ProtoUnmarshal}}(data, msg.(proto.Message))
+	}
+}
+
+//export LLVMFuzzerCustomMutator
+func LLVMFuzzerCustomMutator(data *C.char, size C.size_t, maxSize C.size_t, seed C.uint) C.size_t {
+	msg := new({{.ProtoType}})
+	if err := {{.ProtoUnmarshal}}(cSlice(data, size), msg); err != nil {
+		msg = new({{.ProtoType}})
+	}
+
+	sizeIncreaseHint := int(maxSize) - int(size)
+	if sizeIncreaseHint < 0 {
+		sizeIncreaseHint = 0
+	}
+	if err := mutator.New(int64(seed), sizeIncreaseHint).MutateProto(msg); err != nil {
+		return 0
+	}
+
+	mutated, err := {{.ProtoMarshal}}(msg)
+	if err != nil || len(mutated) > int(maxSize) {
+		return 0
+	}
+	copy(cSlice(data, maxSize), mutated)
+	return C.size_t(len(mutated))
+}
+
+{{end}}//export LLVMFuzzerTestOneInput
 func LLVMFuzzerTestOneInput(data *C.char, size C.size_t) C.int {
-	s := (*[1<<30]byte)(unsafe.Pointer(data))[:size:size]
-	//target.{{.Func}}(s)
+	s := cSlice(data, size)
 	defer catchPanics()
 	LibFuzzer{{.Func}}(s)
 	return 0
 }
 
 func LibFuzzer{{.Func}}(data []byte) int {
-	fuzzer := &testing.F{Data:data, T:testing.NewT()}
+	fuzzer := testing.NewF(data)
 	defer fuzzer.CleanupTempDirs()
 	target.{{.Func}}(fuzzer)
 	return 1
+}
+
+func cSlice(data *C.char, size C.size_t) []byte {
+	if data == nil || size == 0 {
+		return nil
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(data)), size)
 }
 
 func catchPanics() {
@@ -264,3 +361,109 @@ func catchPanics() {
 func main() {
 }
 `))
+
+var coverageTmpl = template.Must(template.New("fuzz_coverage_report_test").Parse(`
+
+package {{.PkgName}}
+
+import (
+	"io/fs"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"runtime"
+	"runtime/pprof"
+	"strings"
+	"testing"
+{{if .Proto}}{{.ProtoCodecImports}}{{end}})
+
+{{if .Proto}}func init() {
+	testing.ProtoUnmarshal = func(data []byte, msg any) error {
+		return {{.ProtoUnmarshal}}(data, msg.(proto.Message))
+	}
+}
+
+{{end}}func TestFuzzCorpus(t *testing.T) {
+	dir := os.Getenv("FUZZ_CORPUS_DIR")
+	if dir == "" {
+		t.Logf("No fuzzing corpus directory set")
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			var err string
+			switch r.(type) {
+			case string:
+				err = r.(string)
+			case runtime.Error:
+				err = r.(runtime.Error).Error()
+			case error:
+				err = r.(error).Error()
+			}
+			if strings.Contains(err, "GO-FUZZ-BUILD-PANIC") {
+				return
+			} else {
+				panic(err)
+			}
+		}
+	}()
+	profname := os.Getenv("FUZZ_PROFILE_NAME")
+	if profname != "" {
+		f, err := os.Create(profname + ".cpu.prof")
+		if err != nil {
+			t.Logf("error creating profile file %s\n", err)
+		} else {
+			_ = pprof.StartCPUProfile(f)
+		}
+	}
+	_, err := ioutil.ReadDir(dir)
+	if err != nil {
+		t.Logf("Not fuzzing corpus directory %s", err)
+		return
+	}
+	// recurse for regressions subdirectory
+	err = filepath.Walk(dir, func(fname string, info fs.FileInfo, err error) error {
+		if info.IsDir() {
+			return nil
+		}
+		data, err := os.ReadFile(fname)
+		if err != nil {
+			t.Error("Failed to read corpus file", err)
+			return err
+		}
+		fuzzer := testing.NewF(data)
+		defer func(){
+			fuzzer.CleanupTempDirs()
+		}()
+		{{.Func}}(fuzzer)
+		return nil
+	})
+	if err != nil {
+		t.Error("Failed to run corpus", err)
+	}
+	if profname != "" {
+		pprof.StopCPUProfile()
+		f, err := os.Create(profname + ".heap.prof")
+		if err != nil {
+			t.Logf("error creating heap profile file %s\n", err)
+		}
+		if err = pprof.WriteHeapProfile(f); err != nil {
+			t.Logf("error writing heap profile file %s\n", err)
+		}
+		f.Close()
+	}
+}
+`))
+
+func buildTestBinary(outPath, coverpkg string, overlayArgs []string) error {
+	args := []string{"test",
+		"-coverpkg", coverpkg,
+		"-vet=off", // otherwise vet will complain unnecessarily
+		"-c", "-o", outPath, "-v"}
+	args = append(args, overlayArgs...)
+	fmt.Println("aaaaaaaaaaaaaaaaargs: ", args)
+	cmd := exec.Command("go", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
