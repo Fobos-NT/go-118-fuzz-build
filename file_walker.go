@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -520,19 +521,59 @@ func (walker *FileWalker) visibleFuzzerPath() string {
 	return strings.TrimSuffix(strings.TrimSuffix(walker.fuzzerPath, ".go"), "_test") + "_libFuzzer.go"
 }
 
-func (walker *FileWalker) cleanUp() {
+// restoreFile stages the backup beside the destination so the final rename is
+// atomic even when the backup and the checkout are on different filesystems.
+func restoreFile(backup, destination string) error {
+	contents, err := os.ReadFile(backup)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(backup)
+	if err != nil {
+		return err
+	}
+	staged, err := os.CreateTemp(filepath.Dir(destination), ".gofuzzrestore-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(staged.Name())
+	defer staged.Close()
+	if err := staged.Chmod(info.Mode().Perm()); err != nil {
+		return err
+	}
+	if _, err := staged.Write(contents); err != nil {
+		return err
+	}
+	if err := staged.Close(); err != nil {
+		return err
+	}
+	return os.Rename(staged.Name(), destination)
+}
+
+func (walker *FileWalker) cleanUp() error {
+	var restoreErrors []error
 	for oldName, renamedTestFile := range walker.renamedTestFiles {
-		err := os.Rename(renamedTestFile, oldName)
-		if err != nil {
-			panic(err)
+		if err := restoreFile(renamedTestFile, oldName); err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("restore %s: %w", oldName, err))
+		} else {
+			delete(walker.renamedTestFiles, oldName)
 		}
 	}
-	// Remove the visible fuzzer path
-	os.Remove(walker.visibleFuzzerPath())
-	err := os.RemoveAll(walker.tmpDir)
-	if err != nil {
-		panic(err)
+	if len(restoreErrors) != 0 {
+		// Do not delete the only remaining copies if restoration failed.
+		return fmt.Errorf("cleanup failed; backups kept in %s: %w", walker.tmpDir, errors.Join(restoreErrors...))
 	}
+	if walker.fuzzerPath != "" {
+		if err := os.Remove(walker.visibleFuzzerPath()); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	for _, path := range walker.rewrittenFiles {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return os.RemoveAll(walker.tmpDir)
 }
 
 func (walker *FileWalker) createRewrittenHarness(path string, fset1 *token.FileSet, parsedFile *ast.File) error {
@@ -540,8 +581,16 @@ func (walker *FileWalker) createRewrittenHarness(path string, fset1 *token.FileS
 	if err != nil {
 		return err
 	}
+	originalInfo, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
 	originalFuzzerFileCopy, err := os.CreateTemp(walker.tmpDir, "")
 	if err != nil {
+		return err
+	}
+	defer originalFuzzerFileCopy.Close()
+	if err := originalFuzzerFileCopy.Chmod(originalInfo.Mode().Perm()); err != nil {
 		return err
 	}
 	_, err = originalFuzzerFileCopy.Write(originalFuzzerContents)
@@ -557,9 +606,22 @@ func (walker *FileWalker) createRewrittenHarness(path string, fset1 *token.FileS
 		return err
 	}
 	var buf bytes.Buffer
-	printer.Fprint(&buf, fset1, parsedFile)
+	// Preserve original source positions in the coverage profile. Temporary
+	// filenames disappear during cleanup, before the report reads the sources.
+	config := printer.Config{Mode: printer.SourcePos, Tabwidth: 8}
+	if err := config.Fprint(&buf, fset1, parsedFile); err != nil {
+		return err
+	}
+	// SourcePos emits line-only directives, which make Go report column zero.
+	// Retain columns as well so go tool cover can render the original source.
+	lines := strings.Split(buf.String(), "\n")
+	for index, line := range lines {
+		if strings.HasPrefix(line, "//line ") {
+			lines[index] = line + ":1"
+		}
+	}
 
-	_, err = fff.Write(buf.Bytes())
+	_, err = fff.WriteString(strings.Join(lines, "\n"))
 	if err != nil {
 		return err
 	}
@@ -614,10 +676,28 @@ func (walker *FileWalker) RewriteFile(path, fuzzFuncName string) {
 		if err != nil {
 			panic(err)
 		}
-	} else if path[len(path)-8:] == "_test.go" && filepath.Dir(path) == filepath.Dir(walker.fuzzerPath) {
+	} else if strings.HasSuffix(path, "_test.go") && filepath.Dir(path) == filepath.Dir(walker.fuzzerPath) {
 		fmt.Println("renaming _test.go file in fuzzer dir: ", path)
 		fileBytes, err := os.ReadFile(path)
 		if err != nil {
+			return
+		}
+		keyName := strings.TrimSuffix(path, "_test.go") + "_libFuzzer.go"
+		if walker.sanitizer == "coverage" {
+			// cmd/cover reads physical files, not virtual overlay additions.
+			// Retain test helpers as regular code but hide the original test file
+			// from go test so only the generated corpus runner gets registered.
+			f, err := os.OpenFile(keyName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+			if err != nil {
+				panic(err)
+			}
+			walker.rewrittenFiles = append(walker.rewrittenFiles, keyName)
+			_, writeErr := fmt.Fprintf(f, "//line %s:1:1\n%s", path, fileBytes)
+			closeErr := f.Close()
+			if err := errors.Join(writeErr, closeErr); err != nil {
+				panic(err)
+			}
+			walker.overlayMap.Replace[path] = ""
 			return
 		}
 		f, err := os.CreateTemp(walker.tmpDir, "")
@@ -632,7 +712,6 @@ func (walker *FileWalker) RewriteFile(path, fuzzFuncName string) {
 		if err = f.Close(); err != nil {
 			panic(err)
 		}
-		keyName := strings.TrimSuffix(path, "_test.go") + "_libFuzzer.go"
 		walker.overlayMap.Replace[keyName] = f.Name()
 	}
 }
@@ -735,7 +814,7 @@ func (walker *FileWalker) CreateStdLibTestingGoFile() error {
 	if err != nil {
 		return err
 	}
-	updatedTestingGoContents := PlaceHooks(string(testingGoFileBytes))
+	updatedTestingGoContents := placeHooks(string(testingGoFileBytes), walker.sanitizer == "coverage")
 	testingGoFile, err := os.CreateTemp(walker.tmpDir, "testing.go")
 	if err != nil {
 		return err
@@ -814,13 +893,15 @@ func (walker *FileWalker) createCoverageRunner(flagFunc, fuzzerPackageName strin
 	if err != nil {
 		return err
 	}
-	walker.overlayMap.Replace["oss_fuzz_coverage_test.go"] = f.Name()
+	walker.overlayMap.Replace[filepath.Join(filepath.Dir(walker.fuzzerPath), "oss_fuzz_coverage_test.go")] = f.Name()
 	return nil
 }
 
 func (walker *FileWalker) CreateAndModifyFiles(modulePath, fuzzerFuncName, flagOverlay, fuzzerPackage string) {
 	if walker.sanitizer == "coverage" {
-		walker.createCoverageRunner(fuzzerFuncName, fuzzerPackage)
+		if err := walker.createCoverageRunner(fuzzerFuncName, fuzzerPackage); err != nil {
+			panic(err)
+		}
 	}
 	fuzzerDir := filepath.Dir(walker.fuzzerPath)
 	filesInFuzzerDir, err := os.ReadDir(fuzzerDir)
@@ -848,8 +929,17 @@ func (walker *FileWalker) CreateAndModifyFiles(modulePath, fuzzerFuncName, flagO
 // takes the file contents og go/src/testing/testing.go
 // and places the hooks and returns the updated file contents
 func PlaceHooks(fileContents string) string {
+	return placeHooks(fileContents, false)
+}
+
+func placeHooks(fileContents string, coverage bool) string {
 	contentsCopy := fileContents
 	for k, v := range hookMap {
+		// The real test runner calls Failed even when the corpus replay passes.
+		// Its normal implementation also works on the fuzzer's zero-value T.
+		if coverage && k == "func (c *common) Failed() bool {" {
+			continue
+		}
 		contentsCopy = strings.Replace(contentsCopy, k, v, 1)
 	}
 	contentsCopy += "\n"

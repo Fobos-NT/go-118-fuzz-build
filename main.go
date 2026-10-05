@@ -149,7 +149,19 @@ func main() {
 	}
 	walker := NewFileWalker()
 	walker.sanitizer = sanitizer
-	defer walker.cleanUp()
+	defer func() {
+		originalPanic := recover()
+		cleanupErr := walker.cleanUp()
+		if cleanupErr != nil {
+			fmt.Fprintln(os.Stderr, cleanupErr)
+		}
+		if originalPanic != nil {
+			panic(originalPanic)
+		}
+		if cleanupErr != nil {
+			panic(cleanupErr)
+		}
+	}()
 
 	var protoTarget *ProtoTarget
 	if *flagProto {
